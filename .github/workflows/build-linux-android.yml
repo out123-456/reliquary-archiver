@@ -1,4 +1,4 @@
-name: build-linux-android
+name: build-linux
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 22.04 起 glibc 2.35,proot 里兼容面更大
+          # 22.04 -> glibc 2.35,proot 里兼容面更大
           - runner: ubuntu-22.04
             arch: x86_64
           - runner: ubuntu-22.04-arm
@@ -37,17 +37,30 @@ jobs:
           sudo apt-get install -y libpcap-dev libwayland-dev pkg-config
       - name: Build
         run: cargo build --release --no-default-features --features pcap,stream
-      - name: Report
-        run: |
-          file target/release/reliquary-archiver
-          ldd target/release/reliquary-archiver || true
-          target/release/reliquary-archiver --version || true
-      - name: Package
+      - name: Package with bundled libpcap
         run: |
           set -eux
-          mkdir -p dist
+          mkdir -p dist/lib
           cp target/release/reliquary-archiver dist/
+          # 把动态 libpcap 一起打包,proot 里不需要 apt install 任何东西
+          PCAP_SO="$(ldd target/release/reliquary-archiver | awk '/libpcap/{print $3}')"
+          cp -L "$PCAP_SO" dist/lib/
+          cat > dist/reliquary-archiver-run <<'SH'
+          #!/bin/sh
+          DIR=$(cd "$(dirname "$0")" && pwd)
+          LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$DIR/reliquary-archiver" "$@"
+          SH
+          sed -i 's/^          //' dist/reliquary-archiver-run
+          chmod +x dist/reliquary-archiver-run
           cp LICENSE dist/ || true
+          ls -lR dist
+      - name: Smoke test
+        run: |
+          set -eux
+          ./dist/reliquary-archiver-run --help | head -20
+      - name: Tarball
+        run: |
+          set -eux
           tar -C dist -czf reliquary-archiver-${{ matrix.arch }}-linux-gnu.tar.gz .
           ls -l reliquary-archiver-${{ matrix.arch }}-linux-gnu.tar.gz
       - uses: actions/upload-artifact@v4
@@ -55,79 +68,3 @@ jobs:
           name: reliquary-archiver-${{ matrix.arch }}-linux-gnu
           path: reliquary-archiver-${{ matrix.arch }}-linux-gnu.tar.gz
           if-no-files-found: error
-
-  android:
-    name: android-aarch64
-    # 第一版是探索性的,失败不阻塞 linux 产物
-    continue-on-error: true
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: moonrepo/setup-rust@v1
-        with:
-          channel: stable
-      - name: Resolve NDK
-        id: ndk
-        run: |
-          set -eux
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/android-sdk}}"
-          if [ -n "${ANDROID_NDK_HOME:-}" ]; then
-            NDK="$ANDROID_NDK_HOME"
-          elif [ -n "${ANDROID_NDK_ROOT:-}" ]; then
-            NDK="$ANDROID_NDK_ROOT"
-          else
-            NDK="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)"
-          fi
-          test -d "$NDK"
-          echo "ndk=$NDK" >> "$GITHUB_OUTPUT"
-          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E 'aarch64-linux-android[0-9]+-clang$' | head
-      - name: Build static libpcap for aarch64-linux-android
-        run: |
-          set -eux
-          NDK='${{ steps.ndk.outputs.ndk }}'
-          TC="$PWD/ndk-toolchain"
-          mkdir -p "$TC"
-          # 把 NDK 的 llvm 工具链接过去,configure 只用 CC/AR/RANLIB
-          ln -s "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/"* "$TC/"
-          export CC="$TC/aarch64-linux-android24-clang"
-          export AR="$TC/llvm-ar"
-          export RANLIB="$TC/llvm-ranlib"
-          export CFLAGS="-O2 -fPIC"
-          curl -fsSL -o libpcap.tar.gz https://www.tcpdump.org/release/libpcap-1.10.4.tar.gz
-          tar xf libpcap.tar.gz
-          cd libpcap-1.10.4
-          ./configure --host=aarch64-linux-android \
-            --prefix="$PWD/../pcap-install" \
-            --enable-static --disable-shared \
-            --disable-dbus --disable-bluetooth
-          make -j"$(nproc)"
-          make install
-          ls -l "$PWD/../pcap-install/lib"
-      - name: Build binary
-        run: |
-          set -eux
-          NDK='${{ steps.ndk.outputs.ndk }}'
-          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          rustup target add aarch64-linux-android
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/aarch64-linux-android24-clang"
-          export CC_aarch64_linux_android="$TC/aarch64-linux-android24-clang"
-          export AR_aarch64_linux_android="$TC/llvm-ar"
-          export PKG_CONFIG_ALLOW_CROSS=1
-          export PKG_CONFIG_LIBDIR="$PWD/pcap-install/lib/pkgconfig"
-          export RUSTFLAGS="-L native=$PWD/pcap-install/lib"
-          cargo build --release --target aarch64-linux-android --no-default-features --features pcap,stream
-          file target/aarch64-linux-android/release/reliquary-archiver
-          llvm-readelf -d target/aarch64-linux-android/release/reliquary-archiver | grep NEEDED || true
-      - name: Package
-        run: |
-          set -eux
-          mkdir -p dist
-          cp target/aarch64-linux-android/release/reliquary-archiver dist/
-          cp LICENSE dist/ || true
-          tar -C dist -czf reliquary-archiver-aarch64-linux-android.tar.gz .
-          ls -l reliquary-archiver-aarch64-linux-android.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: reliquary-archiver-aarch64-linux-android
-          path: reliquary-archiver-aarch64-linux-android.tar.gz
-          if-no-files-found: warn
