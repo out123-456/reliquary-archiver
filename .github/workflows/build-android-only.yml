@@ -1,0 +1,81 @@
+name: build-android-only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: android-aarch64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: moonrepo/setup-rust@v1
+        with:
+          channel: stable
+      - name: Resolve NDK and smoke-test the compiler
+        id: ndk
+        run: |
+          set -eux
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/android-sdk}}"
+          if [ -n "${ANDROID_NDK_HOME:-}" ]; then NDK="$ANDROID_NDK_HOME"
+          elif [ -n "${ANDROID_NDK_ROOT:-}" ]; then NDK="$ANDROID_NDK_ROOT"
+          else NDK="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)"; fi
+          test -d "$NDK"
+          echo "ndk=$NDK" >> "$GITHUB_OUTPUT"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          "$CC" --version
+          printf 'int main(void){return 0;}\n' > hello.c
+          "$CC" hello.c -o hello
+          file hello
+      - name: Build static libpcap
+        run: |
+          set -eux
+          NDK='${{ steps.ndk.outputs.ndk }}'
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC="$BIN/aarch64-linux-android24-clang"
+          export AR="$BIN/llvm-ar"
+          export RANLIB="$BIN/llvm-ranlib"
+          export CFLAGS="-O2 -fPIC"
+          curl -fsSL -o libpcap.tar.gz https://www.tcpdump.org/release/libpcap-1.10.4.tar.gz
+          tar xf libpcap.tar.gz
+          cd libpcap-1.10.4
+          ./configure --host=aarch64-linux-android \
+            --prefix="$PWD/../pcap-install" \
+            --disable-dbus --disable-bluetooth
+          make -j"$(nproc)"
+          make install
+          # 只留静态库,避免产物依赖 libpcap.so
+          rm -f ../pcap-install/lib/libpcap.so*
+          ls -l ../pcap-install/lib
+          cat ../pcap-install/lib/pkgconfig/libpcap.pc
+      - name: Build binary
+        run: |
+          set -eux
+          NDK='${{ steps.ndk.outputs.ndk }}'
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          rustup target add aarch64-linux-android
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android24-clang"
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export PKG_CONFIG_LIBDIR="$PWD/pcap-install/lib/pkgconfig"
+          export RUSTFLAGS="-L native=$PWD/pcap-install/lib"
+          cargo build --release --target aarch64-linux-android --no-default-features --features pcap,stream
+          file target/aarch64-linux-android/release/reliquary-archiver
+          "$BIN/llvm-readelf" -d target/aarch64-linux-android/release/reliquary-archiver | grep NEEDED || true
+      - name: Package
+        run: |
+          set -eux
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/reliquary-archiver dist/
+          cp LICENSE dist/ || true
+          tar -C dist -czf reliquary-archiver-aarch64-linux-android.tar.gz .
+          ls -l reliquary-archiver-aarch64-linux-android.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reliquary-archiver-aarch64-linux-android
+          path: reliquary-archiver-aarch64-linux-android.tar.gz
+          if-no-files-found: error
