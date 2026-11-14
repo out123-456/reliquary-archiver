@@ -129,6 +129,4 @@ jobs:
             reliquary-archiver-aarch64-linux-android.tar.gz \
             --repo "$SELF" \
             --title "Android aarch64 build ($TAG)" \
-            --notes "自动同步上游 $TAG 并构建的 Android aarch64 产物.
-
-上游发布: https://github.com/$UPSTREAM/releases/tag/$TAG"
+            --notes "自动同步上游 $TAG 并构建的 Android aarch64 产物. 上游发布: https://github.com/$UPSTREAM/releases/tag/$TAG"
