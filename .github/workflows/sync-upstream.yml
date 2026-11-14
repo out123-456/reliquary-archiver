@@ -1,0 +1,134 @@
+name: sync-upstream-android
+
+# 上游发布新版本后: 同步到 main -> 构建 Android aarch64 -> 发布 android-<tag>
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: IceDynamix/reliquary-archiver
+  SELF: out123-456/reliquary-archiver
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect upstream release
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "android-$TAG" --repo "$SELF" >/dev/null 2>&1; then
+            echo "android-$TAG 已存在, 跳过"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync upstream tag into main
+        if: steps.up.outputs.new == 'true'
+        run: |
+          set -eux
+          git config user.name "reliquary-archiver bot"
+          git config user.email "reliquary-archiver.bot@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || true
+          git fetch --no-tags upstream "+refs/tags/${{ steps.up.outputs.tag }}:refs/tags/upstream/${{ steps.up.outputs.tag }}"
+          git merge --no-ff "refs/tags/upstream/${{ steps.up.outputs.tag }}" -m "chore: sync upstream ${{ steps.up.outputs.tag }}"
+          git push origin HEAD:main
+
+      - uses: moonrepo/setup-rust@v1
+        if: steps.up.outputs.new == 'true'
+        with:
+          channel: stable
+
+      - name: Resolve NDK and smoke-test compiler
+        if: steps.up.outputs.new == 'true'
+        id: ndk
+        run: |
+          set -eux
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/android-sdk}}"
+          if [ -n "${ANDROID_NDK_HOME:-}" ]; then NDK="$ANDROID_NDK_HOME"
+          elif [ -n "${ANDROID_NDK_ROOT:-}" ]; then NDK="$ANDROID_NDK_ROOT"
+          else NDK="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)"; fi
+          test -d "$NDK"
+          echo "ndk=$NDK" >> "$GITHUB_OUTPUT"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          "$CC" --version
+          printf 'int main(void){return 0;}\n' > hello.c
+          "$CC" hello.c -o hello
+          file hello
+          rm -f hello hello.c
+
+      - name: Build static libpcap
+        if: steps.up.outputs.new == 'true'
+        run: |
+          set -eux
+          NDK='${{ steps.ndk.outputs.ndk }}'
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC="$BIN/aarch64-linux-android24-clang"
+          export AR="$BIN/llvm-ar"
+          export RANLIB="$BIN/llvm-ranlib"
+          export CFLAGS="-O2 -fPIC"
+          curl -fsSL -o libpcap.tar.gz https://www.tcpdump.org/release/libpcap-1.10.4.tar.gz
+          tar xf libpcap.tar.gz
+          cd libpcap-1.10.4
+          ./configure --host=aarch64-linux-android \
+            --prefix="$PWD/../pcap-install" \
+            --disable-dbus --disable-bluetooth
+          make -j"$(nproc)"
+          make install
+          rm -f ../pcap-install/lib/libpcap.so*
+
+      - name: Build android binary
+        if: steps.up.outputs.new == 'true'
+        run: |
+          set -eux
+          NDK='${{ steps.ndk.outputs.ndk }}'
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          rustup target add aarch64-linux-android
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android24-clang"
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export PKG_CONFIG_LIBDIR="$PWD/pcap-install/lib/pkgconfig"
+          export RUSTFLAGS="-L native=$PWD/pcap-install/lib"
+          cargo build --release --target aarch64-linux-android --no-default-features --features pcap,stream
+          file target/aarch64-linux-android/release/reliquary-archiver
+          "$BIN/llvm-readelf" -d target/aarch64-linux-android/release/reliquary-archiver | grep NEEDED
+
+      - name: Package
+        if: steps.up.outputs.new == 'true'
+        run: |
+          set -eux
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/reliquary-archiver dist/
+          cp LICENSE dist/ || true
+          tar -C dist -czf reliquary-archiver-aarch64-linux-android.tar.gz .
+          ls -l reliquary-archiver-aarch64-linux-android.tar.gz
+
+      - name: Publish release
+        if: steps.up.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          TAG="${{ steps.up.outputs.tag }}"
+          gh release create "android-$TAG" \
+            reliquary-archiver-aarch64-linux-android.tar.gz \
+            --repo "$SELF" \
+            --title "Android aarch64 build ($TAG)" \
+            --notes "自动同步上游 $TAG 并构建的 Android aarch64 产物.
+
+上游发布: https://github.com/$UPSTREAM/releases/tag/$TAG"
